@@ -789,13 +789,7 @@ esp_err_t obd_logger_db_file_handler(httpd_req_t *req)
     }
 
     // Get file size
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
-
-    char size_str[16];
-    snprintf(size_str, sizeof(size_str), "%ld", file_size);
-    httpd_resp_set_hdr(req, "Content-Length", size_str);
 
     // Set appropriate content type based on file extension
     if (strstr(filepath, ".json") != NULL)

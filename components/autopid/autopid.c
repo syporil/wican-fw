@@ -59,6 +59,7 @@
 
 #define TEMP_BUFFER_LENGTH 32
 #define ECU_CONNECTED_BIT BIT0
+#define AUTOPID_POLL_JITTER_MS 100
 
 // Backoff tuning (milliseconds)
 // How many consecutive failures before enabling backoff.
@@ -112,27 +113,60 @@ static const uint8_t autopid_protocol_header_length[] = {
     0  // C: USER2 CAN (29 bit ID, 50 kbaud)
 };
 
-// Helper functions
-//  Custom printer function to format numbers with 2 decimal places
-char *formatNumberPrecision(double num)
+static double autopid_round_parameter_value(double value)
 {
-    static char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", num);
+    return round(value * 100.0) / 100.0;
+}
 
-    // Remove trailing zeros after decimal point
-    size_t len = strlen(buf);
-    if (strchr(buf, '.'))
+static cJSON *autopid_add_parameter_number_to_object(cJSON *object,
+                                                     const char *name,
+                                                     float value)
+{
+    return cJSON_AddNumberToObject(object, name, autopid_round_parameter_value((double)value));
+}
+
+static bool autopid_prepare_parameter_value(parameter_t *param,
+                                            double raw_value,
+                                            float *out_value,
+                                            const char *source)
+{
+    double rounded_value;
+
+    if (!param || !out_value)
+        return false;
+
+    if (!isfinite(raw_value))
     {
-        while (len > 0 && buf[len - 1] == '0')
-        {
-            buf[--len] = '\0';
-        }
-        if (len > 0 && buf[len - 1] == '.')
-        {
-            buf[--len] = '\0';
-        }
+        ESP_LOGW(TAG, "%s parameter %s produced non-finite value - ignoring",
+                 source ? source : "AUTO_PID",
+                 param->name ? param->name : "(null)");
+        return false;
     }
-    return buf;
+
+    rounded_value = autopid_round_parameter_value(raw_value);
+
+    if (param->min != FLT_MAX && rounded_value < param->min)
+    {
+        ESP_LOGW(TAG, "%s parameter %s value %.2f below min %.2f - ignoring",
+                 source ? source : "AUTO_PID",
+                 param->name ? param->name : "(null)",
+                 rounded_value,
+                 param->min);
+        return false;
+    }
+
+    if (param->max != FLT_MAX && rounded_value > param->max)
+    {
+        ESP_LOGW(TAG, "%s parameter %s value %.2f above max %.2f - ignoring",
+                 source ? source : "AUTO_PID",
+                 param->name ? param->name : "(null)",
+                 rounded_value,
+                 param->max);
+        return false;
+    }
+
+    *out_value = (float)rounded_value;
+    return true;
 }
 // strdup_psram
 static char *strdup_psram(const char *s)
@@ -147,29 +181,6 @@ static char *strdup_psram(const char *s)
 
     memcpy(copy, s, len);
     return copy;
-}
-
-// Recursively limit decimal precision in the JSON structure
-void limitJsonDecimalPrecision(cJSON *item)
-{
-    if (!item)
-        return;
-
-    // If current item is a number, modify its value
-    if (cJSON_IsNumber(item))
-    {
-        char *formatted = formatNumberPrecision(item->valuedouble);
-        item->valuedouble = atof(formatted);
-        item->valuestring = NULL; // Force cJSON to use valuedouble
-    }
-
-    // Process all children
-    cJSON *child = item->child;
-    while (child)
-    {
-        limitJsonDecimalPrecision(child);
-        child = child->next;
-    }
 }
 
 esp_err_t autopid_set_protocol_number(int32_t protocol_value)
@@ -358,7 +369,7 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
     uint32_t supported_pids = 0;
     uint8_t selected_protocol = 0;
     static const char *supported_protocols[] = {
-        "ATTP0\rATCRA\r",               // Protocol 0
+        "ATTP0\r",               // Protocol 0
         "ATTP6\rATSH7DF\rATCRA\r",      // Protocol 6
         "ATTP7\rATSH18DB33F1\rATCRA\r", // Protocol 7
         "ATTP8\rATSH7DF\rATCRA\r",      // Protocol 8
@@ -454,16 +465,40 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
             ESP_LOG_BUFFER_HEX(TAG, response->data, response->length);
 
             // Skip mode byte (0x41) and PID byte
-            if ((strstr((char *)response->data, "error") == NULL) && response->length >= 7)
+            if ((strstr((char *)response->data, "error") == NULL) && response->length >= 6)
             {
-                uint8_t merged_frame[7] = {0};
-                merge_response_frames(response->data, response->length, merged_frame);
+                // Determine frame size by response length.
+                // CAN responses: 7 bytes per frame [PCI, mode, PID, D1, D2, D3, D4].
+                // ISO/KWP responses: 6 bytes per frame [PID, D1, D2, D3, D4, checksum].
+                bool is_can_frame = (response->length >= 7 && response->length % 7 == 0);
 
-                // Extract bitmap from merged frame
-                supported_pids = (merged_frame[3] << 24) |
-                                 (merged_frame[4] << 16) |
-                                 (merged_frame[5] << 8) |
-                                 merged_frame[6];
+                if (is_can_frame)
+                {
+                    // CAN format: merge 7-byte frames via OR, bitmap at offset 3
+                    uint8_t merged_frame[7] = {0};
+                    merge_response_frames(response->data, response->length, merged_frame);
+
+                    supported_pids = (merged_frame[3] << 24) |
+                                     (merged_frame[4] << 16) |
+                                     (merged_frame[5] << 8) |
+                                     merged_frame[6];
+                }
+                else
+                {
+                    // ISO/KWP format: merge 6-byte frames via OR, bitmap at offset 1
+                    uint8_t merged[6] = {0};
+                    for (uint32_t f = 0; f < response->length; f += 6)
+                    {
+                        for (uint8_t b = 0; b < 6 && (f + b) < response->length; b++)
+                        {
+                            merged[b] |= response->data[f + b];
+                        }
+                    }
+                    supported_pids = (merged[1] << 24) |
+                                     (merged[2] << 16) |
+                                     (merged[3] << 8) |
+                                     merged[4];
+                }
 
                 ESP_LOGI(TAG, "Merged frame bitmap: 0x%08lx", supported_pids);
 
@@ -617,7 +652,7 @@ static void autopid_data_update(autopid_config_t *pids)
                         }
                         else
                         {
-                            cJSON_AddNumberToObject(root, param->name, param->value);
+                            autopid_add_parameter_number_to_object(root, param->name, param->value);
                         }
                     }
                 }
@@ -642,12 +677,11 @@ static void autopid_data_update(autopid_config_t *pids)
                         }
                         else
                         {
-                            cJSON_AddNumberToObject(root, param->name, param->value);
+                            autopid_add_parameter_number_to_object(root, param->name, param->value);
                         }
                     }
                 }
             }
-            limitJsonDecimalPrecision(root);
             autopid_data.json_str = cJSON_PrintUnformatted(root);
             cJSON_Delete(root);
         }
@@ -761,7 +795,7 @@ void autopid_data_publish(void)
                         }
                         else
                         {
-                            cJSON_AddNumberToObject(root, param->name, param->value);
+                            autopid_add_parameter_number_to_object(root, param->name, param->value);
                         }
                     }
                 }
@@ -782,7 +816,7 @@ void autopid_data_publish(void)
                         }
                         else
                         {
-                            cJSON_AddNumberToObject(root, param->name, param->value);
+                            autopid_add_parameter_number_to_object(root, param->name, param->value);
                         }
                     }
                 }
@@ -790,7 +824,7 @@ void autopid_data_publish(void)
 
             if (root->child)
             {
-                limitJsonDecimalPrecision(root);
+                cJSON_AddNumberToObject(root, "timestamp", (double)time(NULL));
                 char *json_str = cJSON_PrintUnformatted(root);
                 if (json_str)
                 {
@@ -1061,6 +1095,18 @@ void autopid_publish_all_destinations(void)
     {
         ESP_LOGW(TAG, "No autopid data to publish");
         return;
+    }
+
+    // Inject timestamp into snapshot JSON
+    {
+        cJSON *ts_root = cJSON_Parse(raw_json);
+        if (ts_root)
+        {
+            cJSON_AddNumberToObject(ts_root, "timestamp", (double)time(NULL));
+            free(raw_json);
+            raw_json = cJSON_PrintUnformatted(ts_root);
+            cJSON_Delete(ts_root);
+        }
     }
 
     // Current time not directly needed with wc_timer; timers store absolute expiry in us
@@ -2049,20 +2095,13 @@ static void process_can_filter_frame(can_filter_t *f, const response_t *rsp)
         double result = 0;
         if (evaluate_expression((uint8_t *)param->expression, (uint8_t *)rsp->data, 0, &result))
         {
-            if (param->min != FLT_MAX && result < param->min)
+            if (autopid_prepare_parameter_value(param, result, &param->value, "CANFLT"))
             {
-                continue;
+                param->failed = false;
+                ESP_LOGI(TAG, "CANFLT 0x%lX param=%s result=%.2f", (unsigned long)f->frame_id,
+                         param->name ? param->name : "(null)", (double)param->value);
+                publish_parameter_mqtt(param);
             }
-            if (param->max != FLT_MAX && result > param->max)
-            {
-                continue;
-            }
-
-            param->failed = false;
-            param->value = (float)(round(result * 100.0) / 100.0);
-            ESP_LOGI(TAG, "CANFLT 0x%lX param=%s result=%.2f", (unsigned long)f->frame_id,
-                     param->name ? param->name : "(null)", (double)param->value);
-            publish_parameter_mqtt(param);
         }
         else
         {
@@ -2961,9 +3000,9 @@ static void publish_parameter_mqtt(parameter_t *param)
             }
             else
             {
-                cJSON_AddNumberToObject(param_json, param->name, param->value);
+                autopid_add_parameter_number_to_object(param_json, param->name, param->value);
             }
-            limitJsonDecimalPrecision(param_json);
+            cJSON_AddNumberToObject(param_json, "timestamp", (double)time(NULL));
             payload = cJSON_PrintUnformatted(param_json);
             cJSON_Delete(param_json);
         }
@@ -3116,25 +3155,22 @@ static void autopid_webhook_task(void *pvParameters)
                     char *raw_json = autopid_data_read();
                     if (raw_json)
                     {
-                        char *url = strdup_psram(webhook_cfg.url);
-                        if (url)
+                        char *body = NULL;
+                        char *current_config_data = NULL;
+                        char *current_status_data = NULL;
+                        char *current_autopid_data = NULL;
+
+                        // Always send settings-style JSON: {config, status, autopid_data}
+                        current_status_data = config_server_get_status_json(true);
+                        current_config_data = autopid_get_config();
+                        current_autopid_data = strdup_psram(raw_json);
+
+                        cJSON *root_obj = cJSON_CreateObject();
+                        if (root_obj)
                         {
-                            char *body = NULL;
-                            char *current_config_data = NULL;
-                            char *current_status_data = NULL;
-                            char *current_autopid_data = NULL;
-
-                            // Always send settings-style JSON: {config, status, autopid_data}
-                            current_status_data = config_server_get_status_json(true);
-                            current_config_data = autopid_get_config();
-                            current_autopid_data = strdup_psram(raw_json);
-
-                            cJSON *root_obj = cJSON_CreateObject();
-                            if (root_obj)
-                            {
-                                cJSON *cfg_obj = NULL;
-                                cJSON *sts_obj = NULL;
-                                cJSON *auto_obj = NULL;
+                            cJSON *cfg_obj = NULL;
+                            cJSON *sts_obj = NULL;
+                            cJSON *auto_obj = NULL;
 
                                 // Build config (full or diff)
                                 cJSON *curr_cfg_src = NULL;
@@ -3432,21 +3468,17 @@ static void autopid_webhook_task(void *pvParameters)
                                 }
 
                                 // Add mock GPS data
-                                cJSON *gps = cJSON_CreateObject();
-                                if (gps)
-                                {
-                                    cJSON_AddNumberToObject(gps, "latitude", 37.7749);
-                                    cJSON_AddNumberToObject(gps, "longitude", -122.4194);
-                                    cJSON_AddNumberToObject(gps, "accuracy", 10);
-                                    cJSON_AddNumberToObject(gps, "altitude", 25.5);
-                                    cJSON_AddNumberToObject(gps, "speed", 15.3);
-                                    cJSON_AddNumberToObject(gps, "heading", 180);
-                                    cJSON_AddItemToObject(root_obj, "gps", gps);
-                                }
-
-                                // Normalize precision across payload
-                                limitJsonDecimalPrecision(root_obj);
-
+                                // cJSON *gps = cJSON_CreateObject();
+                                // if (gps)
+                                // {
+                                //     cJSON_AddNumberToObject(gps, "latitude", 37.7749);
+                                //     cJSON_AddNumberToObject(gps, "longitude", -122.4194);
+                                //     cJSON_AddNumberToObject(gps, "accuracy", 10);
+                                //     cJSON_AddNumberToObject(gps, "altitude", 25.5);
+                                //     cJSON_AddNumberToObject(gps, "speed", 15.3);
+                                //     cJSON_AddNumberToObject(gps, "heading", 180);
+                                //     cJSON_AddItemToObject(root_obj, "gps", gps);
+                                // }
                                 char *printed = cJSON_PrintUnformatted(root_obj);
                                 if (printed)
                                 {
@@ -3471,62 +3503,86 @@ static void autopid_webhook_task(void *pvParameters)
                             }
                             // current_config_data comes from autopid_get_config() and is a cached global → DO NOT free here.
 
-                            if (body)
-                            {
-                                https_client_mgr_config_t cfg = {0};
-                                cfg.url = url;
-                                cfg.timeout_ms = 5000;
+                        if (body)
+                        {
+                                https_client_mgr_response_t last_resp = {0};
+                                esp_err_t post_err = ESP_FAIL;
+                                bool ok = false;
+                                const char *successful_url = NULL;
 
-                                // Detect scheme from URL
-                                bool is_https_url = (strncasecmp(url, "https://", 8) == 0);
-                                if (is_https_url)
+#if HA_WEBHOOK_MAX_URLS > 0
+                                size_t webhook_url_count = webhook_cfg.url_count > 0 ? webhook_cfg.url_count : 1;
+#else
+                                size_t webhook_url_count = 1;
+#endif
+
+                                for (size_t url_index = 0; url_index < webhook_url_count; ++url_index)
                                 {
-                                    // Use built-in certificate bundle for HTTPS
-                                    cfg.use_crt_bundle = true;
-                                    ESP_LOGI(TAG, "Using built-in certificate bundle for webhook HTTPS");
+#if HA_WEBHOOK_MAX_URLS > 0
+                                    const char *target_url = webhook_cfg.url_count > 0 ? webhook_cfg.urls[url_index] : webhook_cfg.url;
+#else
+                                    const char *target_url = webhook_cfg.url;
+#endif
+                                    if (!target_url || target_url[0] == '\0')
+                                        continue;
 
-                                    // For HTTPS, if host is raw IPv4 address, skip CN verification
-                                    const char *host_start = strstr(url, "://");
-                                    host_start = host_start ? host_start + 3 : url;
-                                    char host_buf[64] = {0};
-                                    size_t hi = 0;
-                                    while (host_start[hi] && host_start[hi] != '/' && host_start[hi] != ':' && hi < sizeof(host_buf) - 1)
+                                    https_client_mgr_config_t cfg = {0};
+                                    cfg.url = target_url;
+                                    cfg.timeout_ms = 5000;
+
+                                    // Detect scheme from URL
+                                    bool is_https_url = (strncasecmp(target_url, "https://", 8) == 0);
+                                    if (is_https_url)
                                     {
-                                        host_buf[hi] = host_start[hi];
-                                        hi++;
-                                    }
-                                    bool is_ip = true;
-                                    for (size_t k = 0; k < hi; k++)
-                                    {
-                                        if ((host_buf[k] < '0' || host_buf[k] > '9') && host_buf[k] != '.')
+                                        // Use built-in certificate bundle for HTTPS
+                                        cfg.use_crt_bundle = true;
+                                        ESP_LOGI(TAG, "Using built-in certificate bundle for webhook HTTPS");
+
+                                        // For HTTPS, if host is raw IPv4 address, skip CN verification
+                                        const char *host_start = strstr(target_url, "://");
+                                        host_start = host_start ? host_start + 3 : target_url;
+                                        char host_buf[64] = {0};
+                                        size_t hi = 0;
+                                        while (host_start[hi] && host_start[hi] != '/' && host_start[hi] != ':' && hi < sizeof(host_buf) - 1)
                                         {
-                                            is_ip = false;
-                                            break;
+                                            host_buf[hi] = host_start[hi];
+                                            hi++;
+                                        }
+                                        bool is_ip = true;
+                                        for (size_t k = 0; k < hi; k++)
+                                        {
+                                            if ((host_buf[k] < '0' || host_buf[k] > '9') && host_buf[k] != '.')
+                                            {
+                                                is_ip = false;
+                                                break;
+                                            }
+                                        }
+                                        if (is_ip)
+                                        {
+                                            cfg.skip_common_name = true;
                                         }
                                     }
-                                    if (is_ip)
+
+                                    https_client_mgr_response_t resp = {0};
+                                    post_err = https_client_mgr_request_with_auth(&cfg, HTTPS_METHOD_POST,
+                                                                                  body, strlen(body),
+                                                                                  "application/json",
+                                                                                  NULL,
+                                                                                  NULL,
+                                                                                  &resp);
+
+                                    ok = (post_err == ESP_OK && resp.is_success);
+                                    if (ok)
                                     {
-                                        cfg.skip_common_name = true;
+                                        successful_url = target_url;
+                                        last_resp = resp;
+                                        ESP_LOGI(TAG, "Webhook POST success via %s, status %d", target_url, resp.status_code);
+                                        break;
                                     }
-                                }
 
-                                https_client_mgr_response_t resp = {0};
-                                esp_err_t post_err = https_client_mgr_request_with_auth(&cfg, HTTPS_METHOD_POST,
-                                                                                        body, strlen(body),
-                                                                                        "application/json",
-                                                                                        NULL,
-                                                                                        NULL,
-                                                                                        &resp);
-
-                                bool ok = (post_err == ESP_OK && resp.is_success);
-                                if (ok)
-                                {
-                                    ESP_LOGI(TAG, "Webhook POST success, status %d", resp.status_code);
-                                    // printf("body: %s\n", body);
-                                }
-                                else
-                                {
-                                    ESP_LOGE(TAG, "Webhook POST failed: %s", esp_err_to_name(post_err));
+                                    ESP_LOGE(TAG, "Webhook POST failed via %s: %s", target_url, esp_err_to_name(post_err));
+                                    https_client_mgr_free_response(&last_resp);
+                                    last_resp = resp;
                                 }
 
                                 // Update runtime webhook stats in cache (no filesystem write)
@@ -3540,6 +3596,10 @@ static void autopid_webhook_task(void *pvParameters)
                                     webhook_format_utc(upd.last_post);
                                     upd.last_error[0] = '\0';
                                     upd.last_error_time[0] = '\0';
+                                    if (successful_url)
+                                    {
+                                        ESP_LOGI(TAG, "Webhook delivery completed using %s", successful_url);
+                                    }
                                 }
                                 else
                                 {
@@ -3549,12 +3609,12 @@ static void autopid_webhook_task(void *pvParameters)
                                     webhook_format_utc(upd.last_error_time);
 
                                     char snippet[96] = {0};
-                                    if (resp.data && resp.data_len > 0)
+                                    if (last_resp.data && last_resp.data_len > 0)
                                     {
-                                        size_t n = (size_t)resp.data_len;
+                                        size_t n = (size_t)last_resp.data_len;
                                         if (n > (sizeof(snippet) - 1))
                                             n = (sizeof(snippet) - 1);
-                                        memcpy(snippet, resp.data, n);
+                                        memcpy(snippet, last_resp.data, n);
                                         snippet[n] = '\0';
                                         webhook_sanitize_snippet(snippet);
                                     }
@@ -3569,17 +3629,15 @@ static void autopid_webhook_task(void *pvParameters)
                                     else
                                     {
                                         if (snippet[0])
-                                            snprintf(upd.last_error, sizeof(upd.last_error), "http=%d; resp=%s", resp.status_code, snippet);
+                                            snprintf(upd.last_error, sizeof(upd.last_error), "http=%d; resp=%s", last_resp.status_code, snippet);
                                         else
-                                            snprintf(upd.last_error, sizeof(upd.last_error), "http=%d", resp.status_code);
+                                            snprintf(upd.last_error, sizeof(upd.last_error), "http=%d", last_resp.status_code);
                                     }
                                 }
                                 (void)ha_webhooks_update_cache(&upd);
 
-                                https_client_mgr_free_response(&resp);
-                                free(body);
-                            }
-                            free(url);
+                                https_client_mgr_free_response(&last_resp);
+                            free(body);
                         }
                         free(raw_json);
                     }
@@ -3753,7 +3811,9 @@ static void autopid_task(void *pvParameters)
         {
             ESP_LOGI(TAG, "Device is sleeping, waiting for wakeup");
             obd_logger_disable();
+            dev_status_set_bits(DEV_AUTOPID_IDLE_BIT);
             dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
+            dev_status_clear_bits(DEV_AUTOPID_IDLE_BIT);
             ESP_LOGI(TAG, "Device awake, resuming autopid task");
             obd_logger_enable();
         }
@@ -3762,7 +3822,9 @@ static void autopid_task(void *pvParameters)
         {
             ESP_LOGI(TAG, "Voltage below sleep threshold, pausing autopid until voltage recovers");
             obd_logger_disable();
+            dev_status_set_bits(DEV_AUTOPID_IDLE_BIT);
             dev_status_wait_for_bits(DEV_WAKE_VOLTAGE_OK_BIT, portMAX_DELAY);
+            dev_status_clear_bits(DEV_AUTOPID_IDLE_BIT);
             ESP_LOGI(TAG, "Voltage OK, resuming autopid task");
             obd_logger_enable();
         }
@@ -3771,7 +3833,9 @@ static void autopid_task(void *pvParameters)
         {
             ESP_LOGI(TAG, "Autopid is disabled, waiting for enable");
             obd_logger_disable();
+            dev_status_set_bits(DEV_AUTOPID_IDLE_BIT);
             dev_status_wait_for_bits(DEV_AUTOPID_ENABLED_BIT, portMAX_DELAY);
+            dev_status_clear_bits(DEV_AUTOPID_IDLE_BIT);
             ESP_LOGI(TAG, "Autopid enabled, resuming autopid task");
             obd_logger_enable();
             send_commands(default_init, 50);
@@ -3816,6 +3880,10 @@ static void autopid_task(void *pvParameters)
             // Loop through all PIDs
             for (uint32_t i = 0; i < autopid_config->pid_count; i++)
             {
+                if(dev_status_is_sleeping())
+                {
+                    break; // Break out of PID loop immediately if device goes to sleep
+                }
                 pid_data_t *curr_pid = &autopid_config->pids[i];
                 // Skip if PID type not enabled
                 if ((curr_pid->pid_type == PID_STD && !autopid_config->pid_std_en) ||
@@ -3833,6 +3901,10 @@ static void autopid_task(void *pvParameters)
                 // Loop through parameters
                 for (uint32_t p = 0; p < curr_pid->parameters_count; p++)
                 {
+                    if(dev_status_is_sleeping())
+                    {
+                        break; // Break out of PID loop immediately if device goes to sleep
+                    }
                     parameter_t *param = &curr_pid->parameters[p];
 
                     if (!param->enabled)
@@ -3886,7 +3958,7 @@ static void autopid_task(void *pvParameters)
                         ESP_LOGI(TAG, "Processing parameter: %s", param->name);
                         // Reset timer with parameter period
                         wc_timer_set(&param->timer, param->period);
-
+                        param->timer += ((int64_t)(esp_random() % ((AUTOPID_POLL_JITTER_MS * 2) + 1)) - AUTOPID_POLL_JITTER_MS) * 1000;
                         if (curr_pid->cmd != NULL && strlen(curr_pid->cmd) > 0)
                         {
                             // twai_message_t tx_msg;
@@ -3900,15 +3972,7 @@ static void autopid_task(void *pvParameters)
                             }
 
                             ESP_LOGI(TAG, "Executing command: %s", curr_pid->cmd);
-// if(elm327_process_cmd((uint8_t*)curr_pid->cmd,
-//                     strlen(curr_pid->cmd),
-//                     &tx_msg,
-//                     &autopidQueue) == ESP_OK)
-#if HARDWARE_VER == WICAN_PRO
                         if (elm327_process_cmd((uint8_t *)curr_pid->cmd, strlen(curr_pid->cmd), &autopidQueue, elm327_autopid_cmd_buffer, &elm327_autopid_cmd_buffer_len, &elm327_autopid_last_cmd_time, autopid_parser) == ESP_OK)
-#else
-                        if (elm327_process_cmd((uint8_t *)pid_req[i].pid_command, strlen(pid_req[i].pid_command), &tx_msg, &autopidQueue) == ESP_OK)
-#endif
                         {
                             response_t elm327_response;
                             ESP_LOGI(TAG, "Command processed successfully");
@@ -3937,25 +4001,20 @@ static void autopid_task(void *pvParameters)
                                             evaluate_expression((uint8_t *)param->expression,
                                                                 elm327_response.data, 0, &result))
                                         {
-                                            if (param->min != FLT_MAX && result < param->min)
+                                            param->failed = false;
+                                            if (autopid_prepare_parameter_value(param, result, &param->value, "PID"))
                                             {
-                                                ESP_LOGW(TAG, "Parameter %s value %.2f below min %.2f - ignoring",
-                                                         param->name, result, param->min);
-                                            }
-                                            else if (param->max != FLT_MAX && result > param->max)
-                                            {
-                                                ESP_LOGW(TAG, "Parameter %s value %.2f above max %.2f - ignoring",
-                                                         param->name, result, param->max);
-                                            }
-                                            else
-                                            {
-                                                result = round(result * 100.0) / 100.0;
                                                 ESP_LOGI(TAG, "Parameter %s result: %.2f",
-                                                         param->name, result);
-                                                param->value = result;
+                                                         param->name, param->value);
                                                 autopid_config->last_successful_pid_time = time(NULL);
                                                 publish_parameter_mqtt(param);
                                             }
+                                        }
+                                        else
+                                        {
+                                            param->failed = true;
+                                            ESP_LOGW(TAG, "Parameter %s expression evaluation failed",
+                                                     param->name ? param->name : "(null)");
                                         }
                                     }
                                     else if (curr_pid->pid_type == PID_STD)
@@ -4001,14 +4060,15 @@ static void autopid_task(void *pvParameters)
                                                             ESP_LOGE(TAG, "Failed to extract signal: %s", esp_err_to_name(err));
                                                             break;
                                                         }
-                                                        param->value = roundf(param->value * 100.0) / 100.0;
-                                                        ESP_LOGI(TAG, "Parameter %s result: %.2f %s",
-                                                                 param->name,
-                                                                 param->value,
-                                                                 pid_info->params[p].unit);
-                                                        param->value = roundf(param->value * 100.0) / 100.0;
-                                                        autopid_config->last_successful_pid_time = time(NULL);
-                                                        publish_parameter_mqtt(param);
+                                                        if (autopid_prepare_parameter_value(param, param->value, &param->value, "STD"))
+                                                        {
+                                                            ESP_LOGI(TAG, "Parameter %s result: %.2f %s",
+                                                                     param->name,
+                                                                     param->value,
+                                                                     pid_info->params[p].unit);
+                                                            autopid_config->last_successful_pid_time = time(NULL);
+                                                            publish_parameter_mqtt(param);
+                                                        }
                                                         break;
                                                     }
                                                 }
@@ -4037,7 +4097,7 @@ static void autopid_task(void *pvParameters)
                         // pause 100ms between pid requests
                         xSemaphoreGive(autopid_config->mutex);
                         dev_status_wait_for_bits(DEV_AUTOPID_ELM327_APP_BIT, portMAX_DELAY);
-                        vTaskDelay(pdMS_TO_TICKS(5));
+                        vTaskDelay(pdMS_TO_TICKS(100));
                         xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
                     }
                     else
@@ -4050,7 +4110,7 @@ static void autopid_task(void *pvParameters)
 
             // elm327_unlock();
             xSemaphoreGive(autopid_config->mutex);
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
         // CAN filters monitor window (broadcast frames)

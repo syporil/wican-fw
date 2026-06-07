@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_attr.h" // for EXT_RAM_ATTR
 #include "esp_netif.h"
+#include "esp_wifi_default.h"
 #include <string.h>
 #include <stdlib.h>
 #include "lwip/sockets.h"
@@ -209,6 +210,19 @@ static bool wifi_mgr_reason_is_auth_related(uint8_t reason) {
             return true;
         default:
             return false;
+    }
+}
+
+static void wifi_mgr_apply_sta_hostname(void) {
+    if (sta_netif == NULL || wifi_config.sta_hostname[0] == '\0') {
+        return;
+    }
+
+    esp_err_t ret = esp_netif_set_hostname(sta_netif, wifi_config.sta_hostname);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "STA hostname set to: %s", wifi_config.sta_hostname);
+    } else {
+        ESP_LOGW(TAG, "Failed to set STA hostname '%s': %s", wifi_config.sta_hostname, esp_err_to_name(ret));
     }
 }
 
@@ -516,8 +530,8 @@ esp_err_t wifi_mgr_init(wifi_mgr_config_t* config) {
         if (ap_stations_queue) vQueueDelete(ap_stations_queue);
         esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
         esp_wifi_deinit();
-        esp_netif_destroy(ap_netif);
-        esp_netif_destroy(sta_netif);
+        esp_netif_destroy_default_wifi(ap_netif);
+        esp_netif_destroy_default_wifi(sta_netif);
         vEventGroupDelete(wifi_event_group);
         return ESP_ERR_NO_MEM;
     }
@@ -534,21 +548,23 @@ esp_err_t wifi_mgr_init(wifi_mgr_config_t* config) {
     
     if (ap_netif == NULL || sta_netif == NULL) {
         ESP_LOGE(TAG, "Failed to create network interfaces");
-        if (ap_netif) esp_netif_destroy(ap_netif);
-        if (sta_netif) esp_netif_destroy(sta_netif);
+        if (ap_netif) esp_netif_destroy_default_wifi(ap_netif);
+        if (sta_netif) esp_netif_destroy_default_wifi(sta_netif);
         if (sta_ip_queue) vQueueDelete(sta_ip_queue);
         if (ap_stations_queue) vQueueDelete(ap_stations_queue);
         vEventGroupDelete(wifi_event_group);
         return ESP_ERR_NO_MEM;
     }
+
+    wifi_mgr_apply_sta_hostname();
     
     // Initialize WiFi
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(ret));
-        esp_netif_destroy(ap_netif);
-        esp_netif_destroy(sta_netif);
+        esp_netif_destroy_default_wifi(ap_netif);
+        esp_netif_destroy_default_wifi(sta_netif);
         if (sta_ip_queue) vQueueDelete(sta_ip_queue);
         if (ap_stations_queue) vQueueDelete(ap_stations_queue);
         vEventGroupDelete(wifi_event_group);
@@ -560,8 +576,8 @@ esp_err_t wifi_mgr_init(wifi_mgr_config_t* config) {
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register WiFi event handler: %s", esp_err_to_name(ret));
         esp_wifi_deinit();
-        esp_netif_destroy(ap_netif);
-        esp_netif_destroy(sta_netif);
+        esp_netif_destroy_default_wifi(ap_netif);
+        esp_netif_destroy_default_wifi(sta_netif);
         if (sta_ip_queue) vQueueDelete(sta_ip_queue);
         if (ap_stations_queue) vQueueDelete(ap_stations_queue);
         vEventGroupDelete(wifi_event_group);
@@ -573,8 +589,8 @@ esp_err_t wifi_mgr_init(wifi_mgr_config_t* config) {
         ESP_LOGE(TAG, "Failed to register IP event handler: %s", esp_err_to_name(ret));
         esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
         esp_wifi_deinit();
-        esp_netif_destroy(ap_netif);
-        esp_netif_destroy(sta_netif);
+        esp_netif_destroy_default_wifi(ap_netif);
+        esp_netif_destroy_default_wifi(sta_netif);
         if (sta_ip_queue) vQueueDelete(sta_ip_queue);
         if (ap_stations_queue) vQueueDelete(ap_stations_queue);
         vEventGroupDelete(wifi_event_group);
@@ -622,30 +638,35 @@ esp_err_t wifi_mgr_deinit(void) {
     
     // Disable WiFi first
     wifi_mgr_disable();
-    
+
     // Delete reconnect task if exists
     if (reconnect_task_handle != NULL) {
         vTaskDelete(reconnect_task_handle);
         reconnect_task_handle = NULL;
     }
-    
+
     // Unregister event handlers
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
-    
+
+    // Drain in-flight tcpip work (ARP, DHCP, broadcasts) so packets don't
+    // reach wifi_transmit_wrap after the driver is freed.
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     // Deinitialize WiFi
     esp_err_t ret = esp_wifi_deinit();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi deinit failed: %s", esp_err_to_name(ret));
     }
-    
-    // Clean up network interfaces
+
+    // Default-wifi netifs carry driver glue + default event handlers that
+    // plain esp_netif_destroy() leaves dangling.
     if (ap_netif) {
-        esp_netif_destroy(ap_netif);
+        esp_netif_destroy_default_wifi(ap_netif);
         ap_netif = NULL;
     }
     if (sta_netif) {
-        esp_netif_destroy(sta_netif);
+        esp_netif_destroy_default_wifi(sta_netif);
         sta_netif = NULL;
     }
     
@@ -720,6 +741,8 @@ esp_err_t wifi_mgr_enable(void) {
     
     // Configure STA if needed
     if (wifi_config.mode == WIFI_MGR_MODE_STA || wifi_config.mode == WIFI_MGR_MODE_APSTA) {
+        wifi_mgr_apply_sta_hostname();
+
         wifi_config_t sta_config = {
             .sta = {
                 .threshold.authmode = wifi_config.sta_auth_mode,
